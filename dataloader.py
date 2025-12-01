@@ -12,7 +12,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 import cv2
 
-from torch.utils.data import Dataset, DataLoader
+import torch.distributed as dist
+from torch.utils.data import Dataset, DataLoader, DistributedSampler
 from torchvision import transforms, utils
 from tools.indexs_list import idxs
 
@@ -91,13 +92,25 @@ def collate_fn(data, fixed_padding=None, pad_index=1232):
 class ISLRDataset(Dataset):
     """Sequential Sign language images dataset."""
 
-    def __init__(self, csv_file, root_dir, lookup_table, random_drop, uniform_drop, istrain, transform=None,rescale=224, sos_index=1, eos_index=2, unk_index=0, fixed_padding=None, hand_dir=None, hand_transform=None, channels=3):
+    def __init__(self, csv_file, root_dir, lookup_table, random_drop, uniform_drop, istrain,remove_bg = None, transform=None,rescale=224, sos_index=1, eos_index=2, unk_index=0, fixed_padding=None, hand_dir=None, hand_transform=None, channels=3):
 
         #Get data
         #self.annotations = pd.read_csv(csv_file)
         self.annotations = csv_file
+        # 1) Remove any rows that point to .npy files (like pose.npy)
+        self.annotations = self.annotations[
+            ~self.annotations['video_path'].str.endswith('.npy')]
+
+        # 2) (optional but nice) keep only mp4 / avi / etc.
+        self.annotations = self.annotations[
+            self.annotations['video_path'].str.endswith(('.mp4', '.avi', '.mov'))]
+
+        # 3) Reset index so __len__ and __getitem__ stay consistent
+        self.annotations = self.annotations.reset_index(drop=True)
+
         self.root_dir = root_dir
         self.lookup_table = lookup_table
+        self.remove_bg= remove_bg
         self.hand_dir = hand_dir
         self.random_drop = random_drop
         self.uniform_drop = uniform_drop
@@ -123,7 +136,14 @@ class ISLRDataset(Dataset):
         #Retrieve the name id of sequence from csv annotations
         name = self.annotations.iloc[idx]['video_path']
 
+        name = name.replace('\\', '/')
+
+        # 2. Join with root_dir
         video_path = os.path.join(self.root_dir, name)
+
+        # 3. (Optional but good) Normalize the path
+        video_path = os.path.normpath(video_path)
+
         # Create a VideoCapture object
         cap = cv2.VideoCapture(video_path)
         frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -223,7 +243,7 @@ class SubtractMeans(object):
         return image
 
 
-def loader(csv_file, root_dir, lookup_table, rescale, batch_size, num_workers, random_drop, uniform_drop, show_sample, istrain=False, mean_path='FulFrame_Mean_Image_227x227.npy', fixed_padding=None, hand_dir=None, data_stats=None, hand_stats=None, channels=3):
+def loader(csv_file, root_dir, lookup_table, rescale, batch_size, num_workers, random_drop, uniform_drop, show_sample, remove_bg = None,  local_rank=0, istrain=False, mean_path='FulFrame_Mean_Image_227x227.npy', fixed_padding=None, hand_dir=None, data_stats=None, hand_stats=None, channels=3):
 
     #Note: when using random cropping, this with reshape images with randomCrop size instead of rescale
     if(istrain):
@@ -311,6 +331,7 @@ def loader(csv_file, root_dir, lookup_table, rescale, batch_size, num_workers, r
     transformed_dataset = ISLRDataset(csv_file=csv_file,
                                             root_dir=root_dir,
                                             lookup_table=lookup_table,
+                                            remove_bg=remove_bg,
                                             random_drop=random_drop,
                                             uniform_drop=uniform_drop,
                                             transform=trans,
@@ -325,8 +346,12 @@ def loader(csv_file, root_dir, lookup_table, rescale, batch_size, num_workers, r
 
     #Iterate in batches
     #Note: put num of workers to 0 to avoid memory saturation
-    dataloader = DataLoader(transformed_dataset, batch_size=batch_size,
-                            shuffle=True, num_workers=num_workers, collate_fn=collate_fn)
+    sampler = DistributedSampler(transformed_dataset)
+    # DistributedSampler to split dataset among GPUs
+    sampler = DistributedSampler(transformed_dataset, rank=local_rank, num_replicas=dist.get_world_size())
+
+    dataloader = DataLoader(transformed_dataset, sampler = sampler, batch_size=batch_size,
+                            shuffle=False, num_workers=num_workers, collate_fn=collate_fn)
 
     #Show a sample of the dataset
     if(show_sample and istrain):
